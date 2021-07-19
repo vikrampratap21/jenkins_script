@@ -1,0 +1,147 @@
+//deleteDir()
+def scmVars
+final GIT_URL = 'https://git.xerago.com/repos/cato'
+final GIT_CRED = 'd1a1ff44-bb30-43ca-be15-4d26475eb5f9'
+final GIT_SPARSE_PATH = '/mailmerger-async'
+final DEP_ARTIFACT = 'target/ClientWsAsync-0.0.1-SNAPSHOT.jar'
+final DEP_CRED = 'ACQ_171'
+final DEP_HOST = '10.100.20.171'
+final DEP_PATH = '/home/asai/TEST/async-mail-merger'
+final DEP_STOP_SCRIPT   = "${DEP_PATH}/Nodestop.sh"
+final DEP_START_SCRIPT  = "${DEP_PATH}/Nodestart.sh"
+final DEP_BACKUP_SCRIPT = "${DEP_PATH}/Nodebackup.sh backup"
+final DEP_RESTORE_SCRIPT = "${DEP_PATH}/Nodebackup.sh restore"
+final ANT_HOME = "/opt/apache-ant-1.9.15/bin"
+//final 
+
+properties([
+    parameters([
+        gitParameter(branch: '',
+                branchFilter: 'origin/release/(.*)',
+                defaultValue: '1',
+                description: '',
+                name: 'RELEASE_BRANCH',
+                quickFilterEnabled: true,
+                selectedValue: 'NONE',
+                sortMode: 'DESCENDING_SMART',
+                // tagFilter: '*',
+                type: 'PT_BRANCH')
+	])
+])
+node {    
+    stage('scm-checkout') {
+        echo "release branch choice: ${params.RELEASE_BRANCH}"
+        scmVars = checkout(scm: [
+            $class: 'GitSCM',
+            userRemoteConfigs: [
+                [url: GIT_URL, credentialsId: GIT_CRED]
+            ],
+            branches: [[name: "origin/release/${params.RELEASE_BRANCH}"]],
+            browser: [
+                $class: 'GitWeb',
+                repoUrl: GIT_URL
+            ],
+            extensions: [
+                [$class: 'SparseCheckoutPaths', sparseCheckoutPaths: [[path: GIT_SPARSE_PATH]]],
+                // [$class: 'WipeWorkspace'],
+                [$class: 'CleanCheckout'],
+                [$class: 'CloneOption', shallow: true, depth: 5, honorRefspec: true]
+            ]
+        ])
+        echo "scmVars: ${scmVars}"
+    }
+    dir(GIT_SPARSE_PATH.substring(1)) {
+        stage('build') {
+            withMaven(maven: 'maven-3') {
+                sh "mvn clean install -DskipTests"
+            }
+        }
+        stage('code-quality-gate') {
+            try{
+                sh "${ANT_HOME}/ant -Dpipe=${BUILD_TAG} sonar"
+            }catch(Exception e){
+                echo 'Sonar Failed!'
+            }
+        }
+        def isDeployed = false
+        try {
+            stage('deploy') {
+                input message: 'do you want to deploy?'
+                withCredentials(
+                        [usernamePassword(
+                            credentialsId: DEP_CRED,
+                            usernameVariable: 'USERNAME',
+                            passwordVariable: 'PASSWORD')]) {
+                    def remoteCred = [
+                        name: DEP_CRED,
+                        host: DEP_HOST,
+                        port: 8429,
+                        user: USERNAME,
+                        password: PASSWORD,
+                        allowAnyHosts: true
+                    ]
+                    
+                    echo 'stoping old running artifact.'
+                    sshCommand(remote: remoteCred,
+                            command: DEP_STOP_SCRIPT,
+                            failOnError: true)
+                            
+                    echo 'backing up artifact before deploying.'
+                    sshCommand(remote: remoteCred,
+                            command: DEP_BACKUP_SCRIPT,
+                            failOnError: true)
+    
+                    echo 'deploying artifact...'
+                    sshPut(remote: remoteCred,
+                            from: DEP_ARTIFACT,
+                            into: DEP_PATH,
+                            failOnError: true)
+					isDeployed = true
+                    echo 'starting newly deployed artifact...'
+                    sshCommand(remote: remoteCred,
+                            command: DEP_START_SCRIPT,
+                            failOnError: true)
+                    stage('e2e-test') {
+                        //build job: 'test-e2e-testing-aquigo'
+                    }
+                    
+                    emailext(body: '${DEFAULT_CONTENT}', mimeType: 'text/html',
+                        replyTo: '$DEFAULT_REPLYTO', subject: '${DEFAULT_SUBJECT}',
+                        to: emailextrecipients([[$class: 'CulpritsRecipientProvider'],
+                            [$class: 'RequesterRecipientProvider']]))
+                }
+            }
+        } catch (Exception e) {
+            if (isDeployed) {
+                withCredentials(
+                        [usernamePassword(
+                            credentialsId: DEP_CRED,
+                            usernameVariable: 'USERNAME',
+                            passwordVariable: 'PASSWORD')]) {
+                    def remoteCred = [
+                        name: DEP_CRED,
+                        host: DEP_HOST,
+                        port: 8429,
+                        user: USERNAME,
+                        password: PASSWORD,
+                        allowAnyHosts: true
+                    ]
+                    echo 'restoring artifact.'
+                    sshCommand(remote: remoteCred,
+                            command: DEP_RESTORE_SCRIPT,
+                            failOnError: true)
+                }
+            }
+        }
+    }
+}
+
+
+mkdir /downloads/sonarqube -p
+cd /downloads/sonarqube
+wget https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-4.2.0.1873-linux.zip
+unzip sonar-scanner-cli-4.2.0.1873-linux.zip
+mv sonar-scanner-4.2.0.1873-linux /opt/sonar-scanner
+
+reboot
+source /etc/profile.d/sonar-scanner.sh

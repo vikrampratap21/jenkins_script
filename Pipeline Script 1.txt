@@ -1,0 +1,131 @@
+def scmVars
+final GIT_URL = 'https://git.xerago.com/repos/cato'
+final GIT_CRED = 'd1a1ff44-bb30-43ca-be15-4d26475eb5f9'
+final GIT_SPARSE_PATH = '/CheckCount'
+final DEP_ARTIFACT = 'target/cvmcheckcount-1.jar'
+final DEP_CRED = 'AUB_PROD'
+final DEP_HOST = '64.62.182.229'
+final DEP_PATH = '/All_services/clientws/checkcount'
+final DEP_STOP_SCRIPT = "${DEP_PATH}/Nodestop.sh"
+final DEP_START_SCRIPT = "${DEP_PATH}/Nodestart.sh"
+final DEP_BACKUP_SCRIPT = "${DEP_PATH}/Nodebackup.sh backup"
+final DEP_RESTORE_SCRIPT = "${DEP_PATH}/Nodebackup.sh restore"
+
+properties([
+    parameters([
+        gitParameter(branch: '',
+                branchFilter: 'refs/tags/(.*)',
+                defaultValue: 'test-tag-1',
+                description: '',
+                name: 'RELEASE_VERSION',
+                quickFilterEnabled: true,
+                selectedValue: 'NONE',
+                sortMode: 'DESCENDING_SMART',
+                // tagFilter: '*',
+                type: 'PT_TAG')
+	])
+])
+
+node {
+    stage('scm-checkout') {
+        echo "release tag choice: ${params.RELEASE_VERSION}"
+        scmVars = checkout(scm: [
+            $class: 'GitSCM',
+            userRemoteConfigs: [
+                [url: GIT_URL, credentialsId: GIT_CRED]
+            ],
+            branches: [[name: "refs/tags/${RELEASE_VERSION}"]],
+            browser: [
+                $class: 'GitWeb',
+                repoUrl: GIT_URL
+            ],
+            extensions: [
+                [$class: 'SparseCheckoutPaths', sparseCheckoutPaths: [[path: GIT_SPARSE_PATH]]],
+                [$class: 'PathRestriction', excludedRegions: '*', includedRegions: GIT_SPARSE_PATH],
+                // [$class: 'WipeWorkspace'],
+                [$class: 'CleanCheckout'],
+                [$class: 'CloneOption', shallow: true, depth: 5, honorRefspec: true]
+            ]
+        ])
+        echo "scmVars: ${scmVars}"
+    }
+    dir(GIT_SPARSE_PATH.substring(1)) {
+        stage('build') {
+            withMaven(maven: 'maven-3') {
+                sh "mvn clean install -DskipTests"
+            }
+        }
+        def isDeployed = false
+        try {
+            stage('deploy') {
+                withCredentials(
+                        [usernamePassword(
+                            credentialsId: DEP_CRED,
+                            usernameVariable: 'USERNAME',
+                            passwordVariable: 'PASSWORD')]) {
+                    def remoteCred = [
+                        name: DEP_CRED,
+                        host: DEP_HOST,
+                        port: 8429,
+                        user: USERNAME,
+                        password: PASSWORD,
+                        allowAnyHosts: true
+                    ]
+                    
+                    echo 'stoping old running artifact.'
+                    sshCommand(remote: remoteCred,
+                            command: DEP_STOP_SCRIPT,
+                            failOnError: true)
+                            
+                    echo 'backing up artifact before deploying.'
+                    sshCommand(remote: remoteCred,
+                            command: DEP_BACKUP_SCRIPT,
+                            failOnError: true)
+    
+                    echo 'deploying artifact...'
+                    sshPut(remote: remoteCred,
+                            from: DEP_ARTIFACT,
+                            into: DEP_PATH,
+                            failOnError: true)
+                            
+                    isDeployed = true
+                    
+                    echo 'starting newly deployed artifact...'
+                    sshCommand(remote: remoteCred,
+                            command: DEP_START_SCRIPT,
+                            failOnError: true)
+    
+                    stage('e2e-test') {
+                        build job: 'AUB-e2e-testing-acquigo', wait: true
+                    }
+                    
+                    emailext(body: '${DEFAULT_CONTENT}', mimeType: 'text/html',
+                        replyTo: '$DEFAULT_REPLYTO', subject: '${DEFAULT_SUBJECT}',
+                        to: emailextrecipients([[$class: 'CulpritsRecipientProvider'],
+                            [$class: 'RequesterRecipientProvider']]))
+                }
+            }
+        } catch (Exception e) {
+            if (isDeployed) {
+                withCredentials(
+                        [usernamePassword(
+                            credentialsId: DEP_CRED,
+                            usernameVariable: 'USERNAME',
+                            passwordVariable: 'PASSWORD')]) {
+                    def remoteCred = [
+                        name: DEP_CRED,
+                        host: DEP_HOST,
+                        port: 8429,
+                        user: USERNAME,
+                        password: PASSWORD,
+                        allowAnyHosts: true
+                    ]
+                    echo 'restoring artifact.'
+                    sshCommand(remote: remoteCred,
+                            command: DEP_RESTORE_SCRIPT,
+                            failOnError: true)
+                }
+            }
+        }
+    }
+}
